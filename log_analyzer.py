@@ -8,36 +8,51 @@
 #                     '$request_time';
 
 
-import sys
-import os
-import gzip
-import io
-import re
-import json
 
 
 config = {
-    "REPORT_SIZE": 1000,
+    "REPORT_SIZE": 100,
     "REPORT_DIR": "./reports",
-    "LOG_DIR": "./log"
+    "LOG_DIR": "./log",
+    "CONFIG_DIR": "./config",
+    "LOGGING_FILE": "./monitoring.log",
+    "ERROR_THRESHOLD": 100
 }
 
 
-def configupdate(config, arglist, path = './'):
+log_format = "(?P<remote_addr>.*)\s(?P<remote_user>.*)\s\s(?P<http_x_real_ip>.*)\s\[(?P<time_local>.*)\]\s\"(?P<request>.*)\"\s(?P<status>.*)\s(?P<bytes_sent>.*)\s\"(?P<http_referer>.*)\"\s\"(?P<http_user_agent>.*)\"\s\"(?P<http_x_forwarded_for>.*)\"\s\"(?P<http_X_REQUEST_ID>.*)\"\s\"(?P<http_X_RB_USER>.*)\"\s(?P<request_time>.*)"
+
+
+def loggingsetup(config):
+    """ Настройка логирования """
+    # Если не указан параметр LOGGING_FILE в config, лог пишется в stdout
+    if config.get("LOGGING_FILE") == None:
+        loggingfilename = None
+    else:
+        if config["LOGGING_FILE"] == "":
+            loggingfilename = None
+        else:
+            loggingfilename = config["LOGGING_FILE"]
+    logging.basicConfig(filename = loggingfilename, filemode = "w", format = "[%(asctime)s] %(levelname).1s %(message)s", datefmt = "%Y.%m.%d %H:%M:%S", level = logging.INFO)
+    return 0
+
+
+def configupdate(config, arglist):
     """ Обновление файла конфигурации """
     # Чтение данных json из файла
-    if '--config' in arglist:
+    if "--config" in arglist:
         try:
-            configfile = open(path + arglist[arglist('--config') + 1], mode='r')
+            configfile = open(config["CONFIG_DIR"] + arglist[arglist.index("--config") + 1], mode="r", encoding = "utf_8")
             data = json.load(configfile)
             configfile.close()
         except FileNotFoundError:
-            sys.exit("Файл конфигурации не найден")
+            return 1
     # Обновление конфигурации в словаре config
     newconfig = {}
     for configkey in config:
-        if config.get(configkey) == None:
-            newconfig[configkey] = config[configkey]
+        if data.get(configkey) == None:
+            if data[configkey] != None:
+                newconfig[configkey] = config[configkey]
         else:
             newconfig[configkey] = data[configkey]
     return newconfig
@@ -47,73 +62,189 @@ def findlatestlog(config):
     """
     Ищет лог с максимальной датой в имени файла в папке LOG_DIR
     В случае отсутствия файлов в директории возвращает 0.
-    Возвращает путь к файлу.
+    Возвращает кортеж вида (дата, путь к файлу)
     """
-    ### Проверить существование директории с помощью path.exists
-    ### Проверить наличие файлов логов в директории
-    # Логов в директории может не быть. Вывести сообщение и завершить программу
-    ### Структура переменных (аттрибуты)
+    # Если не существует директории для с логами, завершаем программу
+    if not os.path.isdir(config["LOG_DIR"]):
+        return 1
+
     # Выполняет поиск последнего файла с логами в LOG_DIR по дате в имени файла
-    for dirpath, dirnames, filenames in os.walk(config['LOG_DIR']):
-        maxdate = []
-        maxfilename = ''
-        maxfilepath = ''
+    for dirpath, dirnames, filenames in os.walk(config["LOG_DIR"]):
+        maxdate = ""
+        maxfilename = ""
+        maxfilepath = ""
         for filename in filenames:
-            filedate = re.findall(r'\d{8}',filename)
-            if filedate > maxdate:
-                maxdate = filedate
-                maxfilename = filename
-                maxfilepath = dirpath
-    if maxfilename == '':
-        return 0
-    return maxfilepath + '/' + maxfilename
+            try:
+                filedate = re.match(r"nginx\-access\-ui\.log\-(?P<filedate>\d{8})(\.gz)?",filename).group("filedate")
+                if filedate > maxdate:
+                    maxdate = filedate
+                    maxfilename = filename
+                    maxfilepath = dirpath
+            except:
+                continue
+
+    # В случае отсутствия файлов логов завершаем программу
+    if maxfilename == "":
+        return 2
+    maxdate = maxdate[:4] + "." + maxdate[4:6] + "." + maxdate[6:8]
+    return (maxdate, maxfilepath + "/" + maxfilename)
 
 
-def readlog(logfilepathname):
+def readlog_gen(logfilepathname):
     """
     Генератор. Возвращает строки из файла с логами.
     logfilepathname - путь к файлу с именем файла.
     """
     # Чтение файла в зависимости его типа: gzip или простой
-    if logfilepathname.endswith('.gz'):
-        logfile = gzip.open(config['LOG_DIR'] + '/nginx-access-ui.log-20170630.gz', mode='rt')
+    if logfilepathname.endswith(".gz"):
+        logfile = gzip.open(logfilepathname, mode="rt", encoding = "utf_8")
     else:
-        logfile = open(config['LOG_DIR'] + '/nginx-access-ui.log-20170630.gz', mode='rt')
+        logfile = open(logfilepathname, mode="rt", encoding = "utf_8")
     for line in logfile:
         yield line
     logfile.close()
 
 
-def main(config):
-    '''
-        отчет должен содержать count, count_perc, time_sum, time_perc, time_avg, time_max, time_med
-    '''
-    # Считать конфиг из другого файла через --config
-    # Поиск последнего по дате в имени файла лога
-    # Логов в директории может не быть. Вывести сообщение и завершить программу
-    # Если удачно обработал, то при повторном запуске, если есть файл отчета, оставить как есть
+def parselog(line, log_format):
+    """Возвращает строку с необходимыми для анализа данными: request_url и request_time"""
+    result = {}
+    m = re.match(log_format,line)
+    try:
+        result["request_url"] = re.match(r"(?P<request_method>.*)\s(?P<request_url>.*)\s(?P<request_protocol>.*)", m.group("request")).group("request_url")
+        result["request_time"] = m.group("request_time")
+    except AttributeError:
+        return 1
+    return result
 
-    # Прочесть лог
-    # Провести анализ и парсить нужные поля
-    # Подготовка отчета в шаблон во временный файл
-    # Подстановка в шаблон и переименование файла
-    # Перенести к себе jquery
 
-    # В процессе работы должен вестись файл лога через библиотеку logging. Использовать logging.basicConfig
-    # Уровни info, error, exception
+def analyzelog(latestlogpath, log_format):
+    """
+    Возвращает словарь url из словарей с ключами:
+    count - сколько раз встречается URL, абсолютное значение,
+    count_perc - сколько раз встречается URL, в процентнах относительно общего числа запросов,
+    time_sum - суммарный $request_time для данного URL'а, абсолютное значение,
+    time_perc - суммарный $request_time для данного URL'а, в процентах относительно общего $request_time всех запросов,
+    time_avg - средний $request_time для данного URL'а,
+    time_max - максимальный $request_time для данного URL'а,
+    time_med - медиана $request_time для данного URL'а
+    """
+    # Генератор чтения лога
+    latestlog = readlog_gen(latestlogpath)
+    # Начальные значения переменных
+    result = {}
+    totalcount = 0
+    totaltime = 0
+    errorlines = 0
+    # Сбор $request_time для каждого URL
+    for line in latestlog:
+        pars = parselog(line, log_format)
+        if pars == 1:
+            totalcount += 1
+            errorlines += 1
+            continue
+        if result.get(pars["request_url"]) == None:
+            result[pars["request_url"]] = {}
+            result[pars["request_url"]]["request_time"] = [float(pars["request_time"])]
+        else:
+            result[pars["request_url"]]["request_time"].append(float(pars["request_time"]))
+        totalcount += 1
+        totaltime += float(pars["request_time"])
+    # Рассчёт необходимых значений
+    for url in result:
+        result[url]["count"] = len(result[url]["request_time"])
+        result[url]["count_perc"] = round(result[url]["count"] / totalcount * 100, 3)
+        result[url]["time_sum"] = round(sum(result[url]["request_time"]), 3)
+        result[url]["time_perc"] = round(result[url]["time_sum"] / totaltime * 100, 3)
+        result[url]["time_avg"] = round(result[url]["time_sum"] / result[url]["count"], 3)
+        result[url]["time_max"] = max(result[url]["request_time"])
+        result[url]["time_med"] = round(statistics.median(result[url]["request_time"]), 3)
+        result[url]["url"] = url
+        # Удаление списка с $request_time
+        result[url].pop("request_time")
+    logging.info("Анализ логов завершён.\nОбработано %d логов.\nСуммарное request time логов составляет %.3f.\nОшибок парсинга %d." %(totalcount, totaltime, errorlines))
+    if errorlines > config["ERROR_THRESHOLD"]:
+        return 1
+    return result
+
+
+def reportsizing(parsedlog, config):
+    """  Формирование отчёта размером REPORT_SIZE"""
+    result = list(parsedlog.values())
+    result.sort(key = lambda x: x["time_sum"], reverse = True)
+    return result[:config["REPORT_SIZE"]]
+
+
+def writereport(analyzeresult, reportpath, config):
+    # Если не существует директории для отчетов, создать её
+    if not os.path.isdir(config["REPORT_DIR"]):
+        os.mkdir(config["REPORT_DIR"])
+        logging.info("Создана директория отчётов %s." %config["REPORT_DIR"])
+
+    # Подготовка данных для записи
+    reporttext = str(reportsizing(analyzeresult, config)).replace("\'", "\"")
+
+    # Создание файла отчёта из шаблона
+    reporttemplate = open("report.html", mode = "rt", encoding = "utf_8")
+    report = open(reportpath, mode = "wt", encoding = "utf_8")
+    report.write(reporttemplate.read().replace("$table_json", reporttext))
+    reporttemplate.close()
+    report.close()
+    return 0
+
+
+def main(args, config):
+    try:
+        # Чтение конфигурации из другого файла через --config
+        # Если есть ключи во время запуска приложения, открыть файл и обновить ключи
+        if "--config" in args:
+            newconfig = configupdate(config, args)
+            if newconfig == 1:
+                sys.exit("Файл конфигурации не найден")
+            else:
+                config = newconfig
+
+        # Настройка логирования
+        loggingsetup(config)
+
+        #Поиск последнего файла в LOG_DIR по дате в имени файла
+        logging.info("Начало программы анализа логов nginx.")
+        latestlogpath = findlatestlog(config)
+        if latestlogpath == 1:
+            logging.error("Директории LOG_DIR \"%s\" не существует." % config["LOG_DIR"])
+            sys.exit("Директории с логами не существует.")
+        elif latestlogpath == 1:
+            logging.error("Директория LOG_DIR \"%s\" пустая." % config["LOG_DIR"])
+            sys.exit("Логов в директории" + config["LOG_DIR"] + "не найдено.")
+        logging.info("Найден лог с именем \"%s\"" %latestlogpath[1])
+
+        # Если существует отчет для лога на последнюю дату, завершить программу
+        reportpath = config["REPORT_DIR"] + "/report-" + latestlogpath[0] + ".html"
+        if os.path.isfile(reportpath):
+            logging.info("Работа программы окончена. Отчёт от %s с именем %s уже существует." % (latestlogpath[0], reportpath))
+            sys.exit("Файл отчёта для последнего лога от " + latestlogpath[0] + " существует.")
+
+        # Анализ логов
+        logging.info("Начинаю анализ.")
+        analyzeresult = analyzelog(latestlogpath[1], log_format)
+        if analyzeresult == 1:
+            logging.error("Число ошибок парсинга превысило порог.")
+            sys.exit("Число ошибок парсинга превысило порог.")
+
+        # Запись результатов анализа
+        writereport(analyzeresult, reportpath, config)
+        logging.info("Создан отчёт %s.\nРабота программы завершена успешно." %reportpath)
+    except:
+        logging.exception("Анализ прерван.", exc_info=True)
     return 0
 
 if __name__ == "__main__":
-    #main(config)
-    # Считать конфиг из другого файла через --config
-    # Если есть ключи во время запуска приложения, открыть файл и обновить ключи
-    if '--config' in sys.argv:
-        config = configupdate(config, sys.argv)
+    import sys
+    import os
+    import gzip
+    import re
+    import statistics
+    import json
+    import logging
+    import unittest
 
-    #Поиск последнего файла в LOG_DIR по дате в имени файла
-    latestlog = findlatestlog(config)
-    print(latestlog)
-    #### Если существует отчет с таким именем, завершаем программу
-    print(next(readlog(latestlog)))
-        
-        
+    sys.exit(main(sys.argv, config))
