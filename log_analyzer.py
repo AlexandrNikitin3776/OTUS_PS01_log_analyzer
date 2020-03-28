@@ -226,52 +226,52 @@ def writereport(analyzeresult, reportpath, config):
 
 
 def main(config):
-    # try:
-    # Обновление конфигурации из другого файла через --config
     try:
-        newconfig = configupdate(config)
-    except FileNotFoundError:
-        sys.exit("Файл конфигурации не найден")
-    loggingsetup(config)
+        # Обновление конфигурации из другого файла через --config
+        try:
+            newconfig = configupdate(config)
+        except FileNotFoundError:
+            sys.exit(print("Файл конфигурации не найден"))
+        loggingsetup(config)
 
-    # Поиск последнего файла в LOG_DIR по дате в имени файла
-    logging.info("Начало программы анализа логов nginx.")
-    try:
-        latestlogpath = findlatestlog(config)
-        if latestlogpath is None:
+        # Поиск последнего файла в LOG_DIR по дате в имени файла
+        logging.info("Начало программы анализа логов nginx.")
+        try:
+            latestlogpath = findlatestlog(config)
+            if latestlogpath is None:
+                logging.error(
+                    "Директория LOG_DIR \"%s\" пустая." % config["LOG_DIR"])
+                sys.exit(print("Логов в директории %s не найдено." % config["LOG_DIR"]))
+            logging.info("Найден лог с именем \"%s\"" % latestlogpath[1])
+        except FileNotFoundError:
             logging.error(
-                "Директория LOG_DIR \"%s\" пустая." % config["LOG_DIR"])
-            sys.exit("Логов в директории %s не найдено." % config["LOG_DIR"])
-        logging.info("Найден лог с именем \"%s\"" % latestlogpath[1])
-    except FileNotFoundError:
-        logging.error(
-            "Директории LOG_DIR \"%s\" не существует." % config["LOG_DIR"])
-        sys.exit("Директории с логами не существует.")
+                "Директории LOG_DIR \"%s\" не существует." % config["LOG_DIR"])
+            sys.exit(print("Директории с логами не существует."))
 
-    # Если существует отчет для лога на последнюю дату, завершить программу
-    reportpath = "".join([config["REPORT_DIR"], "/report-",
-                         latestlogpath[0], ".html"])
-    if os.path.isfile(reportpath):
-        logging.info("Работа программы окончена. Отчёт от %s "
-                     "с именем %s уже существует."
-                     % (latestlogpath[0], reportpath))
-        sys.exit("Файл отчёта для последнего лога от %s существует."
-                 % latestlogpath[0])
+        # Если существует отчет для лога на последнюю дату, завершить программу
+        reportpath = "".join([config["REPORT_DIR"], "/report-",
+                             latestlogpath[0], ".html"])
+        if os.path.isfile(reportpath):
+            logging.info("Работа программы окончена.\nОтчёт от %s "
+                         "с именем %s уже существует."
+                         % (latestlogpath[0], reportpath))
+            sys.exit(print("Файл отчёта для последнего лога от %s существует."
+                     % latestlogpath[0]))
 
-    logging.info("Начинаю анализ.")
-    analyzeresult = analyzelog(latestlogpath[1], log_format,
-                               request_format, config)
-    if analyzeresult is None:
-        logging.error("Число ошибок парсинга превысило порог.")
-        sys.exit("Число ошибок парсинга превысило порог.")
+        logging.info("Начинаю анализ.")
+        analyzeresult = analyzelog(latestlogpath[1], log_format,
+                                   request_format, config)
+        if analyzeresult is None:
+            logging.error("Число ошибок парсинга превысило порог.")
+            sys.exit(print("Число ошибок парсинга превысило порог."))
 
-    writereport(analyzeresult, reportpath, config)
-    logging.info("Создан отчёт %s.\nРабота программы завершена успешно."
-                 % reportpath)
-    # except BaseException:
-        # pass
-    # except:
-    logging.exception("Анализ прерван. Трейсбек", exc_info=True)
+        writereport(analyzeresult, reportpath, config)
+        logging.info("Создан отчёт %s.\nРабота программы завершена успешно."
+                     % reportpath)
+    except BaseException:
+        pass
+    except:
+        logging.exception("Анализ прерван. Трейсбек", exc_info=True)
     return 0
 
 if __name__ == "__main__":
