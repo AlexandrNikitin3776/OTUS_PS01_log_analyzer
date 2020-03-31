@@ -57,7 +57,6 @@ def loggingsetup(config):
         format="[%(asctime)s] %(levelname).1s %(message)s",
         datefmt="%Y.%m.%d %H:%M:%S",
         level=logging.INFO)
-    return 0
 
 
 def configupdate(config):
@@ -68,12 +67,9 @@ def configupdate(config):
         help="Путь к файлу конфигурации",
         default=config["CONFIG_PATH"])
     args = parser.parse_args()
-    if os.path.isfile(args.config):
-        with open(args.config, encoding="utf_8") as configfile:
-            data = json.load(configfile)
-            config.update(data)
-    else:
-        raise FileNotFoundError
+    with open(args.config, encoding="utf_8") as configfile:
+        data = json.load(configfile)
+        config.update(data)
     return config
 
 
@@ -83,6 +79,7 @@ def findlatestlog(config):
     В случае отсутствия файлов в директории возвращает 0.
     Возвращает кортеж вида (дата, путь к файлу)
     """
+
     # Если не существует директории для с логами, завершаем программу
     if not os.path.isdir(config["LOG_DIR"]):
         raise FileNotFoundError
@@ -94,17 +91,18 @@ def findlatestlog(config):
         maxfilename = ""
         maxfilepath = ""
         for filename in filenames:
-            try:
-                parsefiledate = re.match(
-                    r"nginx\-access\-ui\.log\-(?P<filedate>\d{8})(\.gz)?",
-                    filename).group("filedate")
-                filedate = datetime.datetime.strptime(parsefiledate, "%Y%m%d")
-                if filedate > maxdate:
-                    maxdate = filedate
-                    maxfilename = filename
-                    maxfilepath = dirpath
-            except (AttributeError, TypeError, ValueError):
+            parsefilematch = re.match(
+                r"nginx\-access\-ui\.log\-(?P<filedate>\d{8})(\.gz)?",
+                filename
+            )
+            if parsefilematch is None:
                 continue
+            parsefiledate = parsefilematch.group("filedate")
+            filedate = datetime.datetime.strptime(parsefiledate, "%Y%m%d")
+            if filedate > maxdate:
+                maxdate = filedate
+                maxfilename = filename
+                maxfilepath = dirpath
 
     # В случае отсутствия файлов логов завершаем программу
     if not maxfilename:
@@ -118,28 +116,29 @@ def readlog_gen(logfilepathname):
     logfilepathname - путь к файлу с именем файла.
     """
     # Чтение файла в зависимости его типа: gzip или простой
-    if logfilepathname.endswith(".gz"):
-        logfile = gzip.open(logfilepathname, mode="rt", encoding="utf_8")
-    else:
-        logfile = open(logfilepathname, mode="rt", encoding="utf_8")
-    for line in logfile:
-        yield line
+    with gzip.open(logfilepathname, mode="rt", encoding="utf_8") \
+            if logfilepathname.endswith(".gz") \
+            else open(logfilepathname, mode="rt", encoding="utf_8") \
+            as logfile:
+        for line in logfile:
+            yield line
     logfile.close()
 
 
-def parselog(line, log_format, request_format):
+def parselog(log, log_format, request_format):
     """
     Возвращает словарь с необходимыми для анализа данными:
     request_url и request_time
     """
     result = {}
-    m = re.match(log_format, line)
-    try:
-        result["request_url"] = re.match(request_format, m.group("request")). \
-                                         group("request_url")
-        result["request_time"] = float(m.group("request_time"))
-    except AttributeError:
-        return 1
+    logmatch = re.match(log_format, log)
+    if logmatch is None:
+        return None
+    requestmatch = re.match(request_format, logmatch.group("request"))
+    if requestmatch is None:
+        return None
+    result["request_url"] = requestmatch.group("request_url")
+    result["request_time"] = float(logmatch.group("request_time"))
     return result
 
 
@@ -165,7 +164,7 @@ def analyzelog(latestlogpath, log_format, request_format, config):
     # Сбор $request_time для каждого URL
     for line in latestlog:
         pars = parselog(line, log_format, request_format)
-        if pars == 1:
+        if pars is None:
             totalcount += 1
             errorlines += 1
             continue
@@ -203,76 +202,58 @@ def analyzelog(latestlogpath, log_format, request_format, config):
     return result
 
 
-def reportsizing(parsedlog, config):
-    """  Формирование отчёта размером REPORT_SIZE"""
-    result = list(parsedlog.values())
-    result.sort(key=lambda x: x["time_sum"], reverse=True)
-    return result[:config["REPORT_SIZE"]]
-
-
 def writereport(analyzeresult, reportpath, config):
     if not os.path.isdir(config["REPORT_DIR"]):
         os.mkdir(config["REPORT_DIR"])
         logging.info("Создана директория отчётов %s." % config["REPORT_DIR"])
 
-    reporttext = str(reportsizing(analyzeresult, config)).replace("\'", "\"")
-
-    reporttemplate = open("report.html", mode="rt", encoding="utf_8")
-    report = open(reportpath, mode="wt", encoding="utf_8")
-    report.write(reporttemplate.read().replace("$table_json", reporttext))
-    reporttemplate.close()
-    report.close()
-    return 0
+    reporttext = json.dumps(sorted(
+        list(analyzeresult.values()),
+        key=lambda x: x["time_sum"],
+        reverse=True)[:config["REPORT_SIZE"]])
+    with open("report.html", mode="rt", encoding="utf_8") as reporttemplate:
+        with open(reportpath, mode="wt", encoding="utf_8") as report:
+            report.write(reporttemplate.read().replace("$table_json", reporttext))
 
 
 def main(config):
     try:
-        # Обновление конфигурации из другого файла через --config
-        try:
-            newconfig = configupdate(config)
-        except FileNotFoundError:
-            sys.exit(print("Файл конфигурации не найден"))
+        newconfig = configupdate(config)
         loggingsetup(config)
 
         # Поиск последнего файла в LOG_DIR по дате в имени файла
         logging.info("Начало программы анализа логов nginx.")
-        try:
-            latestlogpath = findlatestlog(config)
-            if latestlogpath is None:
-                logging.error(
-                    "Директория LOG_DIR \"%s\" пустая." % config["LOG_DIR"])
-                sys.exit(print("Логов в директории %s не найдено." % config["LOG_DIR"]))
-            logging.info("Найден лог с именем \"%s\"" % latestlogpath[1])
-        except FileNotFoundError:
+        latestlogpath = findlatestlog(config)
+        if latestlogpath is None:
             logging.error(
-                "Директории LOG_DIR \"%s\" не существует." % config["LOG_DIR"])
-            sys.exit(print("Директории с логами не существует."))
+                "Логов в директории %s не найдено." % config["LOG_DIR"]
+            )
+            return
+        logging.info("Найден лог с именем \"%s\"" % latestlogpath[1])
 
-        # Если существует отчет для лога на последнюю дату, завершить программу
+        # Если существует отчет для лога на последнюю дату,
+        # завершить программу
         reportpath = "".join([config["REPORT_DIR"], "/report-",
                              latestlogpath[0], ".html"])
         if os.path.isfile(reportpath):
             logging.info("Работа программы окончена.\nОтчёт от %s "
                          "с именем %s уже существует."
                          % (latestlogpath[0], reportpath))
-            sys.exit(print("Файл отчёта для последнего лога от %s существует."
-                     % latestlogpath[0]))
+            return
 
         logging.info("Начинаю анализ.")
         analyzeresult = analyzelog(latestlogpath[1], log_format,
                                    request_format, config)
         if analyzeresult is None:
             logging.error("Число ошибок парсинга превысило порог.")
-            sys.exit(print("Число ошибок парсинга превысило порог."))
+            return
 
         writereport(analyzeresult, reportpath, config)
         logging.info("Создан отчёт %s.\nРабота программы завершена успешно."
                      % reportpath)
-    except BaseException:
-        pass
     except:
-        logging.exception("Анализ прерван. Трейсбек", exc_info=True)
-    return 0
+        logging.exception("Анализ прерван.", exc_info=True)
+    return
 
 if __name__ == "__main__":
     sys.exit(main(config))
