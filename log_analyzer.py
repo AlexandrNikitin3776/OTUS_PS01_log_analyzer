@@ -20,12 +20,13 @@ import logging
 import argparse
 import datetime
 
+import collections
 
 config = {
     "REPORT_SIZE": 1000,
     "REPORT_DIR": "./reports",
     "LOG_DIR": "./log",
-    "CONFIG_PATH": "./config/config.ini",
+    "CONFIG_PATH": "./config/config.json",
     "LOGGING_FILE": "./monitoring.log",
     "ERROR_THRESHOLD_PERCENT": 10
 }
@@ -42,11 +43,13 @@ log_format = "(?P<remote_addr>.*)\s(?P<remote_user>.*)\s\s" \
 request_format = "(?P<request_method>.*)\s(?P<request_url>.*)\s" \
                  "(?P<request_protocol>.*)"
 
+Logfile = collections.namedtuple("Logfile", "path date")
+
 
 def loggingsetup(config):
     """
-    Настройка логирования.
-    Если не указан параметр LOGGING_FILE в config, лог пишется в stdout
+    Logging setup.
+    If there isn't LOGGING_FILE value, logging output sets to stdout
     """
     if config.get("LOGGING_FILE", None) is None or "":
         loggingfilename = None
@@ -60,11 +63,11 @@ def loggingsetup(config):
 
 
 def configupdate(config):
-    """ Обновление файла конфигурации из файла json"""
+    """ Updating configuration file from json file"""
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--config",
-        help="Путь к файлу конфигурации",
+        help="path to config file",
         default=config["CONFIG_PATH"])
     args = parser.parse_args()
     with open(args.config, encoding="utf_8") as configfile:
@@ -75,21 +78,20 @@ def configupdate(config):
 
 def findlatestlog(config):
     """
-    Ищет лог с максимальной датой в имени файла в папке LOG_DIR
-    В случае отсутствия файлов в директории возвращает 0.
-    Возвращает кортеж вида (дата, путь к файлу)
+    Returns log with maximal date in the filename in the LOG_DIR
+    If directory is empty returns None
+    Returns named tuple:
+    ####date
+    ####filepath
     """
 
-    # Если не существует директории для с логами, завершаем программу
+    # Exit program if log directory doesn't exist
     if not os.path.isdir(config["LOG_DIR"]):
         raise FileNotFoundError
 
-    # Выполняет поиск последнего файла с логами
-    # в LOG_DIR по дате в имени файла
+    # Execute search last log file in the LOG_DIR
     for dirpath, dirnames, filenames in os.walk(config["LOG_DIR"]):
-        maxdate = datetime.datetime(1, 1, 1)
-        maxfilename = ""
-        maxfilepath = ""
+        maxfile = Logfile("", datetime.datetime(1, 1, 1))
         for filename in filenames:
             parsefilematch = re.match(
                 r"nginx\-access\-ui\.log\-(?P<filedate>\d{8})(\.gz)?",
@@ -99,27 +101,24 @@ def findlatestlog(config):
                 continue
             parsefiledate = parsefilematch.group("filedate")
             filedate = datetime.datetime.strptime(parsefiledate, "%Y%m%d")
-            if filedate > maxdate:
-                maxdate = filedate
-                maxfilename = filename
-                maxfilepath = dirpath
+            if filedate > maxfile.date:
+                maxfile = Logfile(os.path.join(dirpath, filename), filedate)
 
-    # В случае отсутствия файлов логов завершаем программу
-    if not maxfilename:
+    # Exit program if there isn't any log file in the LOG_DIR
+    if not maxfile.path:
         return None
-    return (maxdate.strftime("%Y.%m.%d"), maxfilepath + "/" + maxfilename)
+    return maxfile._replace(date=maxfile.date.strftime("%Y.%m.%d"))
 
 
 def readlog_gen(logfilepathname):
     """
-    Генератор. Возвращает строки из файла с логами.
-    logfilepathname - путь к файлу с именем файла.
+    Generator.
+    Returns lines from the log file.
+    logfilepathname -  path to the logfile
     """
-    # Чтение файла в зависимости его типа: gzip или простой
-    with gzip.open(logfilepathname, mode="rt", encoding="utf_8") \
-            if logfilepathname.endswith(".gz") \
-            else open(logfilepathname, mode="rt", encoding="utf_8") \
-            as logfile:
+    # Reading file either gzip or plain
+    opener = gzip.open if logfilepathname.endswith(".gz") else open
+    with opener(logfilepathname, mode="rt", encoding="utf_8") as logfile:
         for line in logfile:
             yield line
     logfile.close()
@@ -127,8 +126,7 @@ def readlog_gen(logfilepathname):
 
 def parselog(log, log_format, request_format):
     """
-    Возвращает словарь с необходимыми для анализа данными:
-    request_url и request_time
+    Returns dict with request_url and request_time
     """
     result = {}
     logmatch = re.match(log_format, log)
@@ -144,24 +142,23 @@ def parselog(log, log_format, request_format):
 
 def analyzelog(latestlogpath, log_format, request_format, config):
     """
-    Возвращает словарь url из словарей с ключами:
-    count - сколько раз встречается URL, абсолютное значение,
-    count_perc - сколько раз встречается URL, в процентнах относительно
-        общего числа запросов,
-    time_sum - суммарный $request_time для данного URL'а, абсолютное
-        значение,
-    time_perc - суммарный $request_time для данного URL'а, в процентах
-        относительно общего $request_time всех запросов,
-    time_avg - средний $request_time для данного URL'а,
-    time_max - максимальный $request_time для данного URL'а,
-    time_med - медиана $request_time для данного URL'а
+    Returns url dict with dict values:
+    count - how many times a particular URL appears in the lgofile
+    count_perc - how many times a URL appears in the logfile
+        as a percentage of total request quantity
+    time_sum - summary URL $request_time, absolute value
+    time_perc - summary URL $request_time as a percentage of total
+        requests time
+    time_avg - average URL $request_time
+    time_max - maximum of URL $request_time
+    time_med - median URL $request_time
     """
     latestlog = readlog_gen(latestlogpath)
     result = {}
     totalcount = 0
     totaltime = 0
     errorlines = 0
-    # Сбор $request_time для каждого URL
+    # collecting $request_time values
     for line in latestlog:
         pars = parselog(line, log_format, request_format)
         if pars is None:
@@ -175,7 +172,7 @@ def analyzelog(latestlogpath, log_format, request_format, config):
             result[pars["request_url"]]["request_time"].append(pars["request_time"])
         totalcount += 1
         totaltime += pars["request_time"]
-    # Рассчёт необходимых значений
+    # calculating required values
     for url in result:
         result[url]["count"] = len(result[url]["request_time"])
         result[url]["count_perc"] = round(
@@ -190,22 +187,24 @@ def analyzelog(latestlogpath, log_format, request_format, config):
             statistics.median(result[url]["request_time"]), 3)
         result[url]["url"] = url
         result[url].pop("request_time")
-    logging.info("Анализ логов завершён.\n"
-                 "Обработано %d логов.\n"
-                 "Суммарное request time логов составляет %.3f.\n"
-                 "Ошибок парсинга %d."
+    logging.info("Analyzer ended analysis.\n"
+                 "Processed %d logs.\n"
+                 "Summary log request time is %.3f.\n"
+                 "Parsing errors %d."
                  % (totalcount, totaltime, errorlines))
 
     if config.get("ERROR_THRESHOLD_PERCENT") is not None and totalcount > 0:
         if errorlines / totalcount * 100 >= config["ERROR_THRESHOLD_PERCENT"]:
-            return None
+            logging.error("Analyzer cannot work here. \n"
+                          "Errors quantity exceeded the thrashold.")
+            raise ValueError
     return result
 
 
 def writereport(analyzeresult, reportpath, config):
     if not os.path.isdir(config["REPORT_DIR"]):
         os.mkdir(config["REPORT_DIR"])
-        logging.info("Создана директория отчётов %s." % config["REPORT_DIR"])
+        logging.info("Report directory %s created." % config["REPORT_DIR"])
 
     reporttext = json.dumps(sorted(
         list(analyzeresult.values()),
@@ -221,38 +220,34 @@ def main(config):
         newconfig = configupdate(config)
         loggingsetup(config)
 
-        # Поиск последнего файла в LOG_DIR по дате в имени файла
-        logging.info("Начало программы анализа логов nginx.")
+        # Searching last file in LOG_DIR by date
+        logging.info("Analyzer starts its work.")
         latestlogpath = findlatestlog(config)
         if latestlogpath is None:
             logging.error(
-                "Логов в директории %s не найдено." % config["LOG_DIR"]
+                "In the %s directory is nothing to analyze." % config["LOG_DIR"]
             )
             return
-        logging.info("Найден лог с именем \"%s\"" % latestlogpath[1])
+        logging.info("Analyzer will look at \"%s\" file." % latestlogpath.path)
 
-        # Если существует отчет для лога на последнюю дату,
-        # завершить программу
-        reportpath = "".join([config["REPORT_DIR"], "/report-",
-                             latestlogpath[0], ".html"])
+        # If the report on the last date is exist, exit program
+        reportpath = os.path.join(
+            config["REPORT_DIR"],
+            "report-%s.html" % latestlogpath.date)
         if os.path.isfile(reportpath):
-            logging.info("Работа программы окончена.\nОтчёт от %s "
-                         "с именем %s уже существует."
-                         % (latestlogpath[0], reportpath))
+            logging.info("Analyzer already worked here. Report %s on date %s "
+                         "exists." % (reportpath, latestlogpath.date))
             return
 
-        logging.info("Начинаю анализ.")
-        analyzeresult = analyzelog(latestlogpath[1], log_format,
+        logging.info("Analyzer starts analysis.")
+        analyzeresult = analyzelog(latestlogpath.path, log_format,
                                    request_format, config)
-        if analyzeresult is None:
-            logging.error("Число ошибок парсинга превысило порог.")
-            return
 
         writereport(analyzeresult, reportpath, config)
-        logging.info("Создан отчёт %s.\nРабота программы завершена успешно."
+        logging.info("Analyzer created the report %s. Analyzer ended its work."
                      % reportpath)
     except:
-        logging.exception("Анализ прерван.", exc_info=True)
+        logging.exception("Analysis aborted.\n", exc_info=True)
     return
 
 if __name__ == "__main__":
